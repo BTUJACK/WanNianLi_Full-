@@ -1,0 +1,202 @@
+你想知道 `timerRemind` 云函数文件夹中除了 `index.js` 外需要的文件，核心是**必须的 `package.json`（管理云函数依赖）**，以及**可选的 `config.js`（集中管理配置，方便维护）**，以下是完整文件和代码：
+
+### 一、必须文件：package.json（云函数核心依赖配置）
+微信云函数必须通过 `package.json` 声明依赖（即使仅使用 `wx-server-sdk`），否则部署时会报错。
+
+#### cloudfunctions/timerRemind/package.json 完整代码
+```json
+{
+  "name": "timerRemind",
+  "version": "1.0.0",
+  "description": "万年历定时提醒云函数（邮件+微信订阅消息）",
+  "main": "index.js",
+  "dependencies": {
+    "wx-server-sdk": "latest"
+  },
+  "author": "",
+  "license": "MIT"
+}
+```
+
+##### 文件说明：
+1. **核心作用**：声明云函数的入口文件（`index.js`）和依赖包（`wx-server-sdk` 是微信云开发核心SDK，必须包含）；
+2. **版本说明**：`wx-server-sdk: "latest"` 会自动使用最新兼容版本，适配云开发免费版；
+3. **无需额外依赖**：该云函数仅调用 `sendEmail` 云函数（通过 `cloud.callFunction`），无需直接安装 `nodemailer`（`sendEmail` 云函数已单独安装）。
+
+### 二、可选优化文件：config.js（集中管理配置，推荐添加）
+将 `timerRemind` 云函数中的硬编码配置（如订阅消息模板ID、时间误差范围）抽离到 `config.js`，方便后续修改（无需改动核心逻辑）。
+
+#### cloudfunctions/timerRemind/config.js 完整代码
+```js
+/**
+ * 定时提醒云函数配置文件
+ * 所有可配置项集中管理，避免硬编码
+ */
+module.exports = {
+  // 微信订阅消息模板ID（替换为你自己的！！！）
+  subscribeTemplateId: '你的微信订阅消息模板ID',
+  // 提醒时间匹配误差范围（分钟），默认±1分钟
+  timeErrorRange: 1,
+  // 邮件提醒标题前缀
+  emailTitlePrefix: '【万年历提醒】',
+  // 微信订阅消息跳转页面
+  subscribePagePath: '/pages/schedule/schedule',
+  // 订阅消息字段映射（需和你的模板字段一致）
+  subscribeMsgDataMap: {
+    title: 'thing1', // 提醒标题对应的模板字段
+    time: 'time2'    // 提醒时间对应的模板字段
+  }
+};
+```
+
+##### 配套修改 index.js（接入 config.js）：
+如果添加了 `config.js`，需要修改 `index.js` 引入配置（更易维护），修改后的核心片段如下（完整 `index.js` 见下方）：
+```js
+// 引入配置文件（新增）
+const config = require('./config');
+
+// 替换原有的模板ID等硬编码：
+// 原代码：templateId: '你的微信订阅消息模板ID'
+// 改为：templateId: config.subscribeTemplateId
+
+// 原代码：page: `/pages/schedule/schedule`
+// 改为：page: config.subscribePagePath
+
+// 原代码：thing1 / time2 字段
+// 改为：[config.subscribeMsgDataMap.title]: { value: remind.title }
+```
+
+#### 接入 config.js 后的完整 index.js（可选）
+```js
+// 云函数入口文件
+const cloud = require('wx-server-sdk');
+cloud.init();
+// 引入配置文件（新增）
+const config = require('./config');
+
+const db = cloud.database();
+const _ = db.command;
+
+// 云函数入口函数
+exports.main = async (event, context) => {
+  try {
+    // ========== 1. 基础配置与时间处理 ==========
+    const now = new Date();
+    const nowDate = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
+    const nowHour = now.getHours().toString().padStart(2, '0');
+    const nowMinute = now.getMinutes().toString().padStart(2, '0');
+    const nowTimeStr = `${nowHour}:${nowMinute}`;
+
+    console.log(`定时提醒任务触发 - 当前时间：${nowDate} ${nowTimeStr}`);
+
+    // ========== 2. 构建时间匹配范围（从配置读取误差） ==========
+    const timeMatchList = [];
+    for (let i = -config.timeErrorRange; i <= config.timeErrorRange; i++) {
+      const minute = (parseInt(nowMinute) + i).toString().padStart(2, '0');
+      timeMatchList.push(`${nowHour}:${minute}`);
+    }
+
+    // ========== 3. 查询待提醒的日程 ==========
+    const remindRes = await db.collection('reminds').where({
+      isCompleted: false,
+      date: nowDate,
+      time: _.in(timeMatchList)
+    }).get();
+
+    const needRemindList = remindRes.data;
+    console.log(`查询到待提醒事项：${needRemindList.length} 条`);
+
+    if (needRemindList.length === 0) {
+      return {
+        success: true,
+        msg: '当前无待提醒事项',
+        count: 0
+      };
+    }
+
+    // ========== 4. 遍历发送提醒 ==========
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const remind of needRemindList) {
+      try {
+        // 4.1 邮件提醒
+        if (remind.remindType.includes('email') && remind.email) {
+          const emailRes = await cloud.callFunction({
+            name: 'sendEmail',
+            data: {
+              toEmail: remind.email,
+              title: `${config.emailTitlePrefix}${remind.title}`,
+              content: `你设置的提醒：${remind.title}\n提醒时间：${remind.date} ${remind.time}\n请及时处理～`
+            }
+          });
+
+          if (!emailRes.result.success) {
+            throw new Error(`邮件提醒失败：${emailRes.result.msg}`);
+          }
+        }
+
+        // 4.2 微信订阅消息提醒
+        if (remind.remindType.includes('wechat')) {
+          await cloud.openapi.subscribeMessage.send({
+            touser: remind._openid,
+            templateId: config.subscribeTemplateId,
+            page: config.subscribePagePath,
+            data: {
+              [config.subscribeMsgDataMap.title]: { value: remind.title },
+              [config.subscribeMsgDataMap.time]: { value: `${remind.date} ${remind.time}` }
+            }
+          });
+        }
+
+        // 4.3 标记提醒已发送
+        await db.collection('reminds').doc(remind._id).update({
+          data: {
+            remindSent: true,
+            remindSendTime: db.serverDate()
+          }
+        });
+
+        successCount++;
+      } catch (err) {
+        console.error(`处理提醒失败（ID：${remind._id}）：`, err.message);
+        failCount++;
+      }
+    }
+
+    // ========== 5. 返回结果 ==========
+    return {
+      success: true,
+      msg: `定时提醒任务完成：成功${successCount}条，失败${failCount}条`,
+      count: needRemindList.length,
+      successCount,
+      failCount
+    };
+
+  } catch (error) {
+    console.error('定时提醒云函数执行失败：', error);
+    return {
+      success: false,
+      msg: '定时提醒任务执行失败：' + error.message,
+      count: 0
+    };
+  }
+};
+```
+
+### 三、部署注意事项
+1. **安装依赖**：
+   - 打开微信开发者工具，右键 `timerRemind` 云函数文件夹 → 选择「在终端中打开」；
+   - 执行命令 `npm install`（安装 `package.json` 声明的 `wx-server-sdk`）；
+2. **上传云函数**：
+   - 右键 `timerRemind` 文件夹 → 选择「上传并部署：云端安装依赖」；
+3. **配置定时触发器**：
+   - 云开发控制台 → 云函数 → `timerRemind` → 触发方式 → 添加「定时触发器」；
+   - 推荐配置：触发周期「每分钟」，触发时间「00:00 - 23:59」。
+
+### 总结
+1. **必须文件**：`package.json`（声明依赖，云函数部署必备）；
+2. **推荐文件**：`config.js`（集中管理配置，避免硬编码，后续修改模板ID/时间误差等无需改动核心逻辑）；
+3. 无其他额外文件（如 `node_modules` 会在部署时自动安装，无需手动添加）。
+
+如果部署时遇到「依赖安装失败」「触发器配置报错」等问题，可告诉我具体提示，我会帮你解决。
