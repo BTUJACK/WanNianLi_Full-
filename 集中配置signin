@@ -1,0 +1,219 @@
+你想知道 `signIn` 云函数文件夹中除了 `index.js` 外需要的文件，核心是**必须的 `package.json`（管理云函数依赖，部署必备）**，以及**可选的 `config.js`（集中管理签到配置，方便后续修改）**，以下是完整文件代码和说明：
+
+### 一、必须文件：package.json（云函数依赖配置）
+微信云函数必须通过 `package.json` 声明依赖（哪怕只用到 `wx-server-sdk`），否则部署时会提示“找不到依赖”或运行报错。
+
+#### cloudfunctions/signIn/package.json 完整代码
+```json
+{
+  "name": "signIn",
+  "version": "1.0.0",
+  "description": "万年历签到积分云函数（防重复签到+积分统计）",
+  "main": "index.js",
+  "dependencies": {
+    "wx-server-sdk": "latest"
+  },
+  "author": "",
+  "license": "MIT"
+}
+```
+
+##### 文件说明：
+1. **核心作用**：
+   - `main: "index.js"` 声明云函数的入口文件；
+   - `dependencies` 声明依赖包（`wx-server-sdk` 是微信云开发核心SDK，必须包含）；
+2. **版本适配**：`wx-server-sdk: "latest"` 会自动适配微信云开发免费版，无需指定具体版本；
+3. **无额外依赖**：该云函数仅操作云数据库，无需安装其他第三方包（如 `nodemailer` 等）。
+
+### 二、可选优化文件：config.js（集中管理配置，推荐添加）
+将 `signIn` 云函数中的硬编码配置（如单次签到积分、数据库集合名）抽离到 `config.js`，后续修改积分规则、集合名称时，无需改动核心逻辑，降低维护成本。
+
+#### cloudfunctions/signIn/config.js 完整代码
+```js
+/**
+ * 签到积分云函数配置文件
+ * 所有可配置项集中管理，避免硬编码
+ */
+module.exports = {
+  // 单次签到获得的积分（可自定义，比如连续签到可调整，这里先基础版）
+  signScore: 1,
+  // 存储用户签到信息的数据库集合名称
+  userCollectionName: 'users',
+  // 日期格式化规则（和前端保持一致）
+  dateFormat: 'zh-CN', // 对应 toLocaleDateString('zh-CN')，保证日期格式统一
+  // 提示文案（集中管理，方便多语言/文案调整）
+  tips: {
+    signedToday: '今日已签到，无需重复签到',
+    firstSignSuccess: '首次签到成功，积分+{{score}}',
+    signSuccess: '签到成功，积分+{{score}}',
+    resetSuccess: '积分已重置为0',
+    noSignRecord: '用户无签到记录，无需重置'
+  }
+};
+```
+
+##### 配套修改 index.js（接入 config.js，更易维护）
+如果添加了 `config.js`，需要修改原 `index.js` 引入配置，替换硬编码内容，修改后的完整 `index.js` 如下：
+```js
+// 云函数入口文件
+const cloud = require('wx-server-sdk');
+cloud.init();
+// 引入配置文件（新增）
+const config = require('./config');
+
+const db = cloud.database();
+const _ = db.command;
+
+// 云函数入口函数
+exports.main = async (event, context) => {
+  const wxContext = cloud.getWXContext();
+  const openid = wxContext.OPENID;
+  // 从配置读取日期格式，保证统一
+  const today = new Date().toLocaleDateString(config.dateFormat);
+  // 从配置读取单次签到积分
+  const signScore = config.signScore;
+
+  try {
+    const { action } = event;
+    switch (action) {
+      // 1. 用户签到
+      case 'sign':
+        const userRes = await db.collection(config.userCollectionName).where({
+          _openid: openid
+        }).get();
+
+        if (userRes.data.length > 0) {
+          const user = userRes.data[0];
+          if (user.lastSignDate === today) {
+            return {
+              success: false,
+              msg: config.tips.signedToday,
+              score: user.score || 0,
+              signCount: user.signCount || 0
+            };
+          }
+
+          await db.collection(config.userCollectionName).doc(user._id).update({
+            data: {
+              score: _.inc(signScore),
+              signCount: _.inc(1),
+              lastSignDate: today,
+              updateTime: db.serverDate()
+            }
+          });
+
+          return {
+            success: true,
+            msg: config.tips.signSuccess.replace('{{score}}', signScore),
+            score: (user.score || 0) + signScore,
+            signCount: (user.signCount || 0) + 1
+          };
+        } else {
+          await db.collection(config.userCollectionName).add({
+            data: {
+              _openid: openid,
+              score: signScore,
+              signCount: 1,
+              lastSignDate: today,
+              createTime: db.serverDate(),
+              updateTime: db.serverDate()
+            }
+          });
+
+          return {
+            success: true,
+            msg: config.tips.firstSignSuccess.replace('{{score}}', signScore),
+            score: signScore,
+            signCount: 1
+          };
+        }
+
+      // 2. 查询用户签到信息
+      case 'getSignInfo':
+        const infoRes = await db.collection(config.userCollectionName).where({
+          _openid: openid
+        }).get();
+
+        if (infoRes.data.length > 0) {
+          const user = infoRes.data[0];
+          return {
+            success: true,
+            msg: '查询成功',
+            data: {
+              score: user.score || 0,
+              signCount: user.signCount || 0,
+              lastSignDate: user.lastSignDate || '',
+              isSignedToday: user.lastSignDate === today
+            }
+          };
+        } else {
+          return {
+            success: true,
+            msg: '查询成功（未签到过）',
+            data: {
+              score: 0,
+              signCount: 0,
+              lastSignDate: '',
+              isSignedToday: false
+            }
+          };
+        }
+
+      // 3. 重置用户积分（测试用）
+      case 'resetScore':
+        const resetRes = await db.collection(config.userCollectionName).where({
+          _openid: openid
+        }).get();
+
+        if (resetRes.data.length > 0) {
+          await db.collection(config.userCollectionName).doc(resetRes.data[0]._id).update({
+            data: {
+              score: 0,
+              signCount: 0,
+              lastSignDate: '',
+              updateTime: db.serverDate()
+            }
+          });
+          return {
+            success: true,
+            msg: config.tips.resetSuccess
+          };
+        } else {
+          return {
+            success: false,
+            msg: config.tips.noSignRecord
+          };
+        }
+
+      default:
+        return {
+          success: false,
+          msg: '未知操作类型，请传入正确的action（sign/getSignInfo/resetScore）'
+        };
+    }
+  } catch (error) {
+    console.error('签到云函数执行失败：', error);
+    return {
+      success: false,
+      msg: '签到操作失败：' + error.message
+    };
+  }
+};
+```
+
+### 三、部署关键步骤（必做）
+1. **安装依赖**：
+   - 打开微信开发者工具，右键 `signIn` 云函数文件夹 → 选择「在终端中打开」；
+   - 执行命令 `npm install`（自动安装 `package.json` 中声明的 `wx-server-sdk`）；
+2. **上传部署**：
+   - 右键 `signIn` 文件夹 → 选择「上传并部署：云端安装依赖」；
+   - 部署完成后，可在云开发控制台 → 云函数中看到 `signIn` 云函数，状态为“已部署”；
+3. **测试验证**：
+   - 前端打开「我的」页面，点击「立即签到」，可触发云函数调用，验证是否正常返回积分和提示。
+
+### 总结
+1. **必须文件**：`package.json`（声明云函数依赖，部署和运行的核心文件，缺一不可）；
+2. **推荐文件**：`config.js`（集中管理配置，后续修改签到积分、提示文案等无需改动核心逻辑）；
+3. 无其他额外文件（`node_modules` 会在部署时自动安装，无需手动添加）。
+
+如果部署时遇到「依赖安装失败」「云函数调用返回“找不到模块”」等问题，可告诉我具体的错误提示，我会帮你定位修复。
