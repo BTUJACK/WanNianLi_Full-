@@ -1,0 +1,164 @@
+你想知道 `sendEmail` 云函数文件夹中除了 `index.js` 外需要的文件，核心是**必须的 `package.json`（声明邮件依赖 `nodemailer`，部署必备）**，以及**推荐的 `config.js`（集中管理邮箱配置，避免硬编码敏感信息）**，以下是完整文件代码和部署说明：
+
+### 一、必须文件：package.json（云函数依赖配置）
+`sendEmail` 云函数需要依赖 `nodemailer` 包实现邮件发送（不同于其他仅依赖 `wx-server-sdk` 的云函数），因此必须在 `package.json` 中声明该依赖，否则部署后会提示“找不到 nodemailer 模块”。
+
+#### cloudfunctions/sendEmail/package.json 完整代码
+```json
+{
+  "name": "sendEmail",
+  "version": "1.0.0",
+  "description": "万年历邮件提醒云函数（基于nodemailer发送邮件）",
+  "main": "index.js",
+  "dependencies": {
+    "wx-server-sdk": "latest",
+    "nodemailer": "^6.9.15"
+  },
+  "author": "",
+  "license": "MIT"
+}
+```
+
+##### 文件关键说明：
+1. `nodemailer: "^6.9.15"`：指定稳定版邮件发送依赖（该版本兼容微信云函数运行环境，无兼容问题）；
+2. `wx-server-sdk: "latest"`：保留微信云开发核心SDK（云函数基础依赖）；
+3. 版本选择：`^6.9.15` 表示兼容 6.9.15 及以上小版本，避免自动升级到不兼容版本。
+
+### 二、推荐文件：config.js（集中管理邮箱配置，核心！）
+`sendEmail` 云函数包含邮箱账号、SMTP授权码等敏感信息，抽离到 `config.js` 中集中管理，既方便修改，也能避免在核心逻辑中暴露敏感信息（后续只需改这个文件即可切换邮箱配置）。
+
+#### cloudfunctions/sendEmail/config.js 完整代码
+```js
+/**
+ * 邮件发送云函数配置文件
+ * 替换为你自己的邮箱配置（推荐QQ邮箱）
+ */
+module.exports = {
+  // 邮件服务配置（QQ邮箱示例，其他邮箱需对应修改）
+  emailConfig: {
+    host: 'smtp.qq.com', // QQ邮箱SMTP服务器地址
+    port: 465, // QQ邮箱SMTP端口（465为SSL端口，更安全）
+    secure: true, // 开启SSL加密（必须为true，否则无法连接）
+    auth: {
+      user: '你的QQ邮箱@qq.com', // 发送邮件的邮箱账号（替换！）
+      pass: '你的QQ邮箱SMTP授权码' // 邮箱SMTP授权码（替换！）
+    }
+  },
+  // 发件人名称（显示在收件箱的“发件人”栏）
+  fromName: '万年历提醒',
+  // 默认邮件标题前缀
+  defaultTitlePrefix: '【万年历】',
+  // 邮件发送失败提示文案
+  errorTips: {
+    configError: '邮箱配置错误，请检查config.js中的邮箱账号和授权码',
+    sendFail: '邮件发送失败：',
+    paramMissing: '收件人邮箱/邮件标题不能为空'
+  }
+};
+```
+
+##### 配置说明（必看）：
+- QQ邮箱SMTP授权码获取方式：登录QQ邮箱 → 设置 → 账户 → 开启“POP3/SMTP服务” → 按提示获取授权码（**不是QQ密码**）；
+- 其他邮箱适配：如163邮箱，`host` 改为 `smtp.163.com`，`port` 仍为465，`auth` 替换为163邮箱账号和授权码即可。
+
+### 三、配套修改 index.js（接入 config.js，更易维护）
+引入 `config.js` 后，替换原硬编码的邮箱配置，修改后的完整 `index.js` 如下：
+```js
+// 云函数入口文件
+const cloud = require('wx-server-sdk');
+cloud.init();
+// 引入配置文件（新增）
+const config = require('./config');
+// 引入邮件发送依赖
+const nodemailer = require('nodemailer');
+
+// 创建邮件发送器（从配置读取参数）
+const transporter = nodemailer.createTransport(config.emailConfig);
+
+// 云函数入口函数
+exports.main = async (event, context) => {
+  const { toEmail, title, content } = event;
+
+  // 参数校验（从配置读取提示文案）
+  if (!toEmail || !title) {
+    return {
+      success: false,
+      msg: config.errorTips.paramMissing
+    };
+  }
+
+  // 构建邮件内容
+  const mailOptions = {
+    from: `"${config.fromName}" <${config.emailConfig.auth.user}>`, // 发件人（名称+邮箱）
+    to: toEmail, // 收件人邮箱
+    subject: `${config.defaultTitlePrefix}${title}`, // 邮件标题（拼接前缀）
+    text: content || '无内容' // 邮件正文（纯文本）
+  };
+
+  try {
+    // 发送邮件
+    const info = await transporter.sendMail(mailOptions);
+    console.log('邮件发送成功：', info.messageId);
+    return {
+      success: true,
+      msg: '邮件发送成功',
+      messageId: info.messageId
+    };
+  } catch (error) {
+    console.error('邮件发送失败：', error);
+    // 区分配置错误和发送错误
+    if (error.message.includes('Authentication failed')) {
+      return {
+        success: false,
+        msg: config.errorTips.configError
+      };
+    }
+    return {
+      success: false,
+      msg: config.errorTips.sendFail + error.message
+    };
+  }
+};
+```
+
+### 四、部署关键步骤（必做！）
+`sendEmail` 云函数因依赖 `nodemailer`，部署步骤比其他云函数多一步“安装第三方依赖”，具体如下：
+1. **打开终端安装依赖**：
+   - 微信开发者工具中，右键 `sendEmail` 云函数文件夹 → 选择「在终端中打开」；
+   - 执行命令：
+     ```bash
+     npm install
+     ```
+   - 等待终端提示“added xx packages”，表示依赖安装成功（会生成 `node_modules` 文件夹，无需手动操作）；
+2. **上传并部署云函数**：
+   - 右键 `sendEmail` 文件夹 → 选择「上传并部署：云端安装依赖」（必须选这个选项，否则云端会缺失 `nodemailer`）；
+3. **测试验证**：
+   - 前端在「日程提醒」页面添加带邮件提醒的日程，或手动调用云函数测试：
+     ```js
+     // 测试代码（可临时加在pages/schedule/schedule.js中）
+     wx.cloud.callFunction({
+       name: 'sendEmail',
+       data: {
+         toEmail: '你的测试邮箱@xxx.com',
+         title: '测试邮件',
+         content: '这是万年历邮件提醒测试'
+       },
+       success: res => {
+         console.log('邮件测试结果：', res.result);
+       }
+     });
+     ```
+
+### 总结
+1. **必须文件**：
+   - `package.json`：声明 `wx-server-sdk` 和 `nodemailer` 依赖，无此文件部署失败；
+2. **核心推荐文件**：
+   - `config.js`：集中管理邮箱账号、授权码等敏感配置，避免硬编码（新手必加，否则改配置要翻核心逻辑）；
+3. 无其他额外文件（`node_modules` 由 `npm install` 自动生成，无需手动添加）。
+
+### 常见问题排查
+- 部署后提示“找不到 nodemailer”：未执行 `npm install` 或部署时选了“仅上传文件”（需重新选「上传并部署：云端安装依赖」）；
+- 邮件发送失败提示“Authentication failed”：`config.js` 中的邮箱账号或授权码错误（重新获取授权码并核对）；
+- 提示“connect ECONNREFUSED”：`config.js` 中的 `host`/`port` 配置错误（QQ邮箱固定为 `smtp.qq.com:465`）。
+
+如果遇到上述问题或其他报错，可告诉我具体的错误提示，我会帮你定位修复。
