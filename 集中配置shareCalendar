@@ -1,0 +1,188 @@
+你想知道 `shareCalendar` 云函数文件夹中除了 `index.js` 外需要的文件，核心是**必须的 `package.json`（云函数依赖配置，部署必备）**，以及**可选的 `config.js`（集中管理配置，降低维护成本）**，以下是完整文件代码和详细说明：
+
+### 一、必须文件：package.json（云函数依赖配置）
+微信云函数无论是否使用第三方依赖，都需要 `package.json` 声明入口文件和核心依赖（`wx-server-sdk`），否则部署时会报错“找不到入口文件”或运行时缺失SDK。
+
+#### cloudfunctions/shareCalendar/package.json 完整代码
+```json
+{
+  "name": "shareCalendar",
+  "version": "1.0.0",
+  "description": "万年历共享日历云函数（添加成员/查询日历/权限校验）",
+  "main": "index.js",
+  "dependencies": {
+    "wx-server-sdk": "latest"
+  },
+  "author": "",
+  "license": "MIT"
+}
+```
+
+##### 文件关键说明：
+1. `main: "index.js"`：指定云函数的入口文件为 `index.js`，是云函数运行的核心标识；
+2. `wx-server-sdk: "latest"`：使用最新版微信云开发SDK，兼容个人主体云开发免费版，无需手动指定版本；
+3. 无额外依赖：该云函数仅操作云数据库和权限校验，无需安装 `nodemailer` 等第三方包，依赖极简。
+
+### 二、可选优化文件：config.js（集中管理配置，推荐添加）
+将 `shareCalendar` 云函数中的硬编码内容（如数据库集合名、提示文案、权限规则）抽离到 `config.js`，后续修改集合名、提示语时，无需改动核心业务逻辑，新手也能轻松维护。
+
+#### cloudfunctions/shareCalendar/config.js 完整代码
+```js
+/**
+ * 共享日历云函数配置文件
+ * 集中管理可配置项，避免硬编码
+ */
+module.exports = {
+  // 存储共享日历的数据库集合名称
+  shareCalendarCollection: 'shareCalendars',
+  // 提示文案（统一管理，方便修改）
+  tips: {
+    paramMissing: '参数缺失：{{param}}不能为空',
+    calendarNotExist: '共享日历不存在',
+    addMemberSuccess: '添加共享成员成功',
+    noPermission: '你无权限查看该共享日历',
+    querySuccess: '查询成功',
+    unknownAction: '未知操作类型：请传入正确的action（addMember/getDetail/getUserCalendars）'
+  },
+  // 支持的操作类型（防止非法action调用）
+  validActions: ['addMember', 'getDetail', 'getUserCalendars']
+};
+```
+
+##### 配套修改 index.js（接入 config.js，逻辑更健壮）
+如果添加了 `config.js`，需要修改原 `index.js` 引入配置，替换硬编码内容，修改后的完整 `index.js` 如下：
+```js
+// 云函数入口文件
+const cloud = require('wx-server-sdk');
+cloud.init();
+// 引入配置文件（新增）
+const config = require('./config');
+
+const db = cloud.database();
+const _ = db.command;
+
+// 云函数入口函数
+exports.main = async (event, context) => {
+  const { action, calendarId, friendOpenid } = event;
+  const wxContext = cloud.getWXContext();
+  const currentOpenid = wxContext.OPENID;
+
+  try {
+    // 校验操作类型是否合法（新增：从配置读取合法action）
+    if (!config.validActions.includes(action)) {
+      return {
+        success: false,
+        msg: config.tips.unknownAction
+      };
+    }
+
+    // 根据不同操作类型处理逻辑
+    switch (action) {
+      // 1. 给共享日历添加成员（分享给好友）
+      case 'addMember':
+        // 参数校验（从配置读取提示文案）
+        if (!calendarId) {
+          return {
+            success: false,
+            msg: config.tips.paramMissing.replace('{{param}}', '日历ID')
+          };
+        }
+        if (!friendOpenid) {
+          return {
+            success: false,
+            msg: config.tips.paramMissing.replace('{{param}}', '好友OpenID')
+          };
+        }
+
+        // 从配置读取集合名，避免硬编码
+        const calendarRes = await db.collection(config.shareCalendarCollection).doc(calendarId).get();
+        if (!calendarRes.data) {
+          return {
+            success: false,
+            msg: config.tips.calendarNotExist
+          };
+        }
+
+        // 添加成员（去重）
+        await db.collection(config.shareCalendarCollection).doc(calendarId).update({
+          data: {
+            members: _.addToSet(friendOpenid),
+            updateTime: db.serverDate()
+          }
+        });
+
+        return {
+          success: true,
+          msg: config.tips.addMemberSuccess,
+          calendarId: calendarId
+        };
+
+      // 2. 查询共享日历详情
+      case 'getDetail':
+        if (!calendarId) {
+          return {
+            success: false,
+            msg: config.tips.paramMissing.replace('{{param}}', '日历ID')
+          };
+        }
+
+        const detailRes = await db.collection(config.shareCalendarCollection).doc(calendarId).get();
+        if (!detailRes.data) {
+          return {
+            success: false,
+            msg: config.tips.calendarNotExist
+          };
+        }
+
+        // 校验当前用户是否有权限查看
+        if (!detailRes.data.members.includes(currentOpenid)) {
+          return {
+            success: false,
+            msg: config.tips.noPermission
+          };
+        }
+
+        return {
+          success: true,
+          msg: config.tips.querySuccess,
+          data: detailRes.data
+        };
+
+      // 3. 获取用户所有共享日历
+      case 'getUserCalendars':
+        const userCalRes = await db.collection(config.shareCalendarCollection).where({
+          members: currentOpenid
+        }).orderBy('createTime', 'desc').get();
+
+        return {
+          success: true,
+          msg: config.tips.querySuccess,
+          data: userCalRes.data
+        };
+    }
+  } catch (error) {
+    console.error('共享日历云函数执行失败：', error);
+    return {
+      success: false,
+      msg: '执行失败：' + error.message
+    };
+  }
+};
+```
+
+### 三、部署关键步骤（必做）
+1. **安装依赖**：
+   - 打开微信开发者工具，右键 `shareCalendar` 云函数文件夹 → 选择「在终端中打开」；
+   - 执行命令 `npm install`（自动安装 `package.json` 中声明的 `wx-server-sdk`）；
+2. **上传部署**：
+   - 右键 `shareCalendar` 文件夹 → 选择「上传并部署：云端安装依赖」；
+   - 部署完成后，可在云开发控制台 → 云函数中看到 `shareCalendar`，状态为“已部署”；
+3. **测试验证**：
+   - 前端打开「共享日历」页面，创建日历后点击“分享”，触发云函数调用，验证是否能正常添加成员。
+
+### 总结
+1. **必须文件**：`package.json`（云函数部署和运行的核心文件，无此文件会部署失败）；
+2. **推荐文件**：`config.js`（集中管理配置，后续修改集合名、提示文案等无需改动核心逻辑，新手友好）；
+3. 无其他额外文件（`node_modules` 会在部署时自动安装，无需手动添加）。
+
+如果部署时遇到「依赖安装失败」「云函数调用提示“集合不存在”」等问题，可告诉我具体的错误提示，我会帮你定位并修复。
